@@ -37,8 +37,8 @@ Servicio independiente para notificaciones en tiempo real y persistencia de aler
 │  │  /notifications/socket.io/*  → notifications:3002 (WebSocket)      │ │
 │  └────────────────────────────┬───────────────────────────────────────┘ │
 │                               │                                         │
-│  ┌────────────────────────────▼───────────────────────────────────────┐ │
-│  │  Notifications Microservice (Node.js :3002)                        │ │
+│  ┌─ ───────────────────────────▼───────────────────────────────────────┐ │
+│  │  Notifications Microservice (Node.js :3002)                       │ │
 │  │                                                                    │ │
 │  │  POST /api/notifications/send          ← Backend PHP (API Key)     │ │
 │  │  POST /api/notifications/send-bulk     ← Backend PHP (API Key)     │ │
@@ -270,206 +270,291 @@ Marca todas las notificaciones del usuario como leídas.
 
 ---
 
-## Integración con WebSocket (Frontend)
+## Integración Frontend (Implementada)
 
-### Instalación
+La integración frontend ya está implementada y conectada al ecosistema existente de Redux + React Router.
 
-```bash
-cd it_web_service-Front
-npm install socket.io-client
+### Archivos creados en el Frontend
+
+```
+it_web_service-Front/src/
+├── global/
+│   └── notificationsURL.js                          # URL base del microservicio
+├── services/
+│   └── notificationSocket.js                        # Cliente Socket.io (connect/disconnect/getSocket)
+├── store/slices/notificationsSlice/
+│   ├── notificationsSlice.js                        # Redux slice (state + reducers)
+│   ├── notificationsThunks.js                       # Thunks (fetch, markRead, sendManual)
+│   └── index.js                                     # Barrel export
+└── app/
+    ├── hooks/
+    │   └── useNotifications.js                      # Hook principal (socket + redux + lifecycle)
+    └── components/notifications/
+        ├── NotificationBell.jsx                     # Campana con badge (integrada en Navbar)
+        ├── NotificationPanel.jsx                    # Panel desplegable con lista
+        └── NotificationItem.jsx                     # Item individual con deep-linking
 ```
 
-### Conexión y escucha de eventos
+### Archivos modificados en el Frontend
 
-```javascript
-// src/services/notificationSocket.js
-import { io } from 'socket.io-client';
+| Archivo | Cambio |
+|---|---|
+| `src/store/store.js` | Se agrego `notifications: notificationsSlice.reducer` |
+| `src/app/components/Navbar.jsx` | Se reemplazo el boton hardcodeado por `<NotificationBell />` |
+| `src/store/slices/authtentication/thunks.js` | Se agrego `disconnectNotifications()` + `clearNotifications()` al logout |
 
-const NOTIFICATIONS_URL = import.meta.env.VITE_NOTIFICATIONS_URL
-    || 'http://localhost:3002';
+### Flujo de datos
 
-let socket = null;
-
-/**
- * Conecta al microservicio de notificaciones y registra el userId.
- */
-export const connectNotifications = (userId) => {
-    if (socket?.connected) return socket;
-
-    socket = io(NOTIFICATIONS_URL, {
-        path: '/notifications/socket.io',
-        transports: ['websocket', 'polling'],
-        reconnection: true,
-        reconnectionDelay: 1000,
-        reconnectionAttempts: 10,
-    });
-
-    socket.on('connect', () => {
-        console.log('[Notifications] Conectado:', socket.id);
-        socket.emit('register', userId);
-    });
-
-    socket.on('disconnect', (reason) => {
-        console.log('[Notifications] Desconectado:', reason);
-    });
-
-    return socket;
-};
-
-/**
- * Desconecta del servicio de notificaciones.
- */
-export const disconnectNotifications = () => {
-    if (socket) {
-        socket.disconnect();
-        socket = null;
-    }
-};
-
-export const getSocket = () => socket;
+```
+1. Usuario hace login
+   ↓
+2. AppRoutes renderiza Navbar → NotificationBell
+   ↓
+3. NotificationBell usa useNotifications()
+   ↓
+4. useNotifications():
+   ├── Lee IdEmpleado del Redux state.auth
+   ├── Conecta Socket.io y emite 'register' con IdEmpleado
+   ├── Escucha eventos: 'new-notification', 'unread-count', 'broadcast-notification'
+   ├── Despacha fetchNotifications() y fetchUnreadCount() (carga inicial)
+   └── Al desmontar: disconnectNotifications() + clearNotifications()
+   ↓
+5. Cuando llega un evento WebSocket:
+   ├── 'new-notification' → dispatch(addNewNotification) → se agrega al inicio de la lista
+   ├── 'unread-count' → dispatch(setUnreadCount) → actualiza el badge rojo
+   └── 'broadcast-notification' → dispatch(addNewNotification) → se agrega como nueva
+   ↓
+6. Usuario interactua:
+   ├── Click en campana → abre/cierra NotificationPanel
+   ├── Click en notificación → markAsRead + navegar a metadata.route (deep-link)
+   ├── "Marcar todas como leidas" → markAllAsRead → badge se pone en 0
+   └── "Cargar mas" → fetchMoreNotifications (paginación)
+   ↓
+7. Usuario hace logout:
+   ├── disconnectNotifications() → cierra socket
+   └── clearNotifications() → limpia Redux state
 ```
 
-### Uso en un componente React
+### Uso del hook useNotifications
 
 ```jsx
-// src/app/components/NotificationBell.jsx
-import { useEffect, useState } from 'react';
-import { connectNotifications, disconnectNotifications, getSocket } from '../../services/notificationSocket';
+import { useNotifications } from '../../hooks/useNotifications';
 
-const NOTIF_API = 'http://localhost:3002/api/notifications';
+const MiComponente = () => {
+    const {
+        notifications,   // Array de notificaciones
+        unreadCount,      // Numero para el badge
+        isLoading,        // true mientras carga
+        hasMore,          // true si hay mas paginas
+        isConnected,      // true si WebSocket esta conectado
+        markAsRead,       // (notificationId) => void
+        markAllAsRead,    // () => void
+        loadMore,         // () => void - carga siguiente pagina
+        refresh,          // () => void - recarga desde pagina 1
+    } = useNotifications();
 
-export const NotificationBell = ({ userId }) => {
-    const [unreadCount, setUnreadCount] = useState(0);
-    const [notifications, setNotifications] = useState([]);
-
-    useEffect(() => {
-        // Conectar WebSocket
-        const socket = connectNotifications(userId);
-
-        // Escuchar notificaciones en tiempo real
-        socket.on('new-notification', (notification) => {
-            setNotifications((prev) => [notification, ...prev]);
-        });
-
-        socket.on('unread-count', ({ count }) => {
-            setUnreadCount(count);
-        });
-
-        socket.on('broadcast-notification', (notification) => {
-            setNotifications((prev) => [notification, ...prev]);
-        });
-
-        // Cargar conteo inicial
-        fetch(`${NOTIF_API}/${userId}/unread-count`)
-            .then((r) => r.json())
-            .then((res) => setUnreadCount(res.data.count));
-
-        return () => disconnectNotifications();
-    }, [userId]);
-
-    const markAsRead = async (id) => {
-        await fetch(`${NOTIF_API}/${id}/read`, { method: 'PATCH' });
-    };
-
-    const markAllRead = async () => {
-        await fetch(`${NOTIF_API}/${userId}/read-all`, { method: 'PATCH' });
-    };
-
-    return (
-        <div>
-            <button>
-                Notificaciones {unreadCount > 0 && <span>({unreadCount})</span>}
-            </button>
-            {/* Panel de notificaciones */}
-        </div>
-    );
+    return <div>No leidas: {unreadCount}</div>;
 };
 ```
+
+### Configurar URL en produccion
+
+Editar `src/global/notificationsURL.js`:
+
+```javascript
+// export const NOTIFICATIONS_URL = 'http://localhost:3002'; //* Local
+export const NOTIFICATIONS_URL = 'https://tu-dominio.com'; //* Produccion (Nginx proxea)
+```
+
+### Socket.io client (ya incluido)
+
+El paquete `socket.io-client` ya existe en `package.json` del frontend (version 4.8.3). No se requiere instalacion adicional.
 
 ---
 
-## Integración con Backend PHP
+## Integración Backend PHP (Implementada)
 
-### Ejemplo: Disparar notificación desde un Controller
+Se creo la clase `NotificationService` en `classes/NotificationService.php` que cualquier Controller puede usar.
 
-```php
-// En cualquier Controller del backend PHP existente
-// Ejemplo: al crear una cotización, notificar al vendedor asignado
+### Archivo creado
 
-private static function notificarUsuario(
-    string $recipientId,
-    string $title,
-    string $message,
-    string $module = 'general',
-    string $type = 'system',
-    array  $metadata = []
-): void {
-    $notificationsUrl = 'http://notifications:3002/api/notifications/send';
-    $apiKey = getenv('NOTIFICATIONS_API_KEY') ?: 'changeme-generate-a-secure-key';
-
-    $payload = json_encode([
-        'recipientId' => $recipientId,
-        'type'        => $type,
-        'module'      => $module,
-        'title'       => $title,
-        'message'     => $message,
-        'metadata'    => $metadata,
-    ]);
-
-    $ch = curl_init($notificationsUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => $payload,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 5,
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            'x-api-key: ' . $apiKey,
-        ],
-    ]);
-
-    $result = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($httpCode !== 201) {
-        error_log("[Notifications] Error al enviar notificacion: HTTP $httpCode - $result");
-    }
-}
+```
+it_web_service-Backend_R/
+└── classes/
+    └── NotificationService.php    # Clase estática con send(), sendBulk(), broadcast()
 ```
 
-### Ejemplo de uso en CRMController
+### Variables agregadas al .env del backend
+
+```ini
+NOTIFICATIONS_URL=http://notifications:3002
+NOTIFICATIONS_API_KEY=changeme-generate-a-secure-key
+```
+
+### API de la clase NotificationService
 
 ```php
+use Classes\NotificationService;
+
+// Enviar a un usuario
+NotificationService::send(
+    recipientId: '42',
+    title: 'Nueva cotización asignada',
+    message: 'Se te asignó la cotización #1234',
+    module: 'crm',            // 'crm' | 'logistica' | 'mtto' | 'general'
+    type: 'system',            // 'manual' | 'system' | 'reminder' | 'alert'
+    senderId: '7',             // null = notificacion del sistema
+    metadata: ['route' => '/crmModulo/cotizacion/1234']
+);
+
+// Enviar a multiples usuarios
+NotificationService::sendBulk(
+    recipientIds: ['42', '15', '8'],
+    title: 'Mantenimiento programado',
+    message: 'El sistema estará en mantenimiento el sábado.',
+    module: 'general',
+    type: 'system'
+);
+
+// Broadcast a todos los conectados
+NotificationService::broadcast(
+    title: 'Actualización del sistema',
+    message: 'Se ha desplegado la versión 2.5.0.'
+);
+```
+
+### Ejemplo: CRMController - Notificar al crear cotización
+
+```php
+use Classes\NotificationService;
+
 public static function insertCotizacion_v2(): void
 {
-    // ... lógica existente de crear cotización ...
+    $headers = getallheaders();
+    $data = json_decode(file_get_contents("php://input"), true);
 
-    $resultado = $cotizacion->insert();
+    // ... validación de tokens y datos existente ...
+
+    $dataTokenDecoded = validadorTokenCrm($headers['Authorization'], $headers['X-Refresh-Token']);
+
+    $cotizacion = new Cotizacion($data);
+    $resultado = $cotizacion->insertCotizacion($dataTokenDecoded['database']);
 
     if ($resultado['success']) {
         // Notificar al vendedor asignado
-        self::notificarUsuario(
-            $resultado['data']['IdEmpleado'],
+        NotificationService::send(
+            $data['IdEmpleado'],
             'Nueva cotización asignada',
-            "Se te asignó la cotización #{$resultado['data']['IdCotizacion']}",
+            "Se te asignó la cotización #{$resultado['data']['IdCotizacion']} del cliente {$data['RazonSocial']}",
             'crm',
             'system',
+            $dataTokenDecoded[0]->IdEmpleado,  // senderId: quien creo la cotización
             ['route' => "/crmModulo/cotizacion/{$resultado['data']['IdCotizacion']}"]
         );
     }
 
-    HTTPreponse(1, 200, "Exito", $resultado['data']);
+    $refreshToken = $dataTokenDecoded['nuevoToken'] ?? null;
+    HTTPreponse(1, 200, "Exito", $resultado['data'], $refreshToken);
 }
 ```
 
-### Agregar la API Key al `.env` del backend
+### Ejemplo: LogisticaControl - Notificar al cerrar ruta
 
-Agregar al archivo `it_web_service-Backend_R/.env`:
+```php
+use Classes\NotificationService;
 
-```ini
-NOTIFICATIONS_API_KEY=<misma_clave_que_en_el_.env_raiz>
+public static function setStateRfso(): void
+{
+    // ... lógica existente de actualizar RFSO ...
+
+    $resultado = logisticaModel::setUpdateRFSOStatus($bd, $idRfso, 1);
+
+    if ($resultado) {
+        // Notificar al operador de logística
+        NotificationService::send(
+            $idEmpleadoOperador,
+            'RFSO actualizado',
+            "El RFSO #{$idRfso} fue marcado como entregado",
+            'logistica',
+            'system',
+            null,
+            ['route' => "/logisticaModulo/entregas/{$idOrd}/{$idRfso}"]
+        );
+    }
+
+    HTTPreponse(1, 200, "Exito", $resultado);
+}
 ```
+
+### Ejemplo: MantenimientoController - Notificar al crear OT
+
+```php
+use Classes\NotificationService;
+
+public static function CreateOT(): void
+{
+    // ... lógica existente de crear Orden de Trabajo ...
+
+    $resultado = $ordenTrabajo->crearBlock($dataTokenDecoded['database']);
+
+    if ($resultado[0]) {
+        // Notificar al técnico asignado
+        NotificationService::send(
+            $data['IdEmpleadoTecnico'],
+            'Nueva Orden de Trabajo',
+            "Se te asignó la OT #{$resultado[1]} para el equipo {$data['NombreEquipo']}",
+            'mtto',
+            'system',
+            $dataTokenDecoded[0]->IdEmpleado,
+            ['route' => "/mttoModulo/ordenes/{$resultado[1]}/{$data['IdEquipo']}"]
+        );
+    }
+
+    HTTPreponse(1, 200, "Exito", $resultado);
+}
+```
+
+### Ejemplo: Recordatorio automático (cron o trigger)
+
+```php
+use Classes\NotificationService;
+
+// Desde un script PHP ejecutado por cron o un endpoint de sistema
+NotificationService::sendBulk(
+    ['42', '15', '8', '23'],
+    'Recordatorio: Revisión semanal',
+    'Recuerda completar tu revisión semanal de equipos asignados antes del viernes.',
+    'mtto',
+    'reminder',
+    null,
+    ['route' => '/mttoModulo']
+);
+```
+
+### Ejemplo: Notificación manual (usuario a usuario)
+
+```php
+use Classes\NotificationService;
+
+// Endpoint para que un usuario envie un mensaje a otro
+public static function enviarNotificacionManual(): void
+{
+    $headers = getallheaders();
+    $data = json_decode(file_get_contents("php://input"), true);
+
+    $dataTokenDecoded = validadorTokenCrm($headers['Authorization'], $headers['X-Refresh-Token']);
+
+    NotificationService::send(
+        $data['recipientId'],
+        $data['title'],
+        $data['message'],
+        $data['module'] ?? 'general',
+        'manual',
+        $dataTokenDecoded[0]->IdEmpleado   // El que envia
+    );
+
+    HTTPreponse(1, 200, "Notificacion enviada");
+}
 
 ---
 
