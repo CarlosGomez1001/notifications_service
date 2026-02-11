@@ -1,28 +1,38 @@
 const { getIO } = require('../config/socket');
 
 /**
- * Emite una notificación en tiempo real al usuario destino.
- * Si el usuario tiene múltiples pestañas/dispositivos, todas reciben el evento.
+ * Emite una notificación en tiempo real al usuario destino dentro de su tenant.
+ * Room format: "user:{tenant}:{recipientId}"
  */
-const emitToUser = (recipientId, notification) => {
+const emitToUser = (tenant, recipientId, notification) => {
     const io = getIO();
-    io.to(`user:${recipientId}`).emit('new-notification', notification);
+    io.to(`user:${tenant}:${recipientId}`).emit('new-notification', notification);
 };
 
 /**
- * Emite un evento de actualización de contador de no leídas.
+ * Emite un evento de actualización de contador de no leídas (scoped por tenant).
  */
-const emitUnreadCount = (recipientId, count) => {
+const emitUnreadCount = (tenant, recipientId, count) => {
     const io = getIO();
-    io.to(`user:${recipientId}`).emit('unread-count', { count });
+    io.to(`user:${tenant}:${recipientId}`).emit('unread-count', { count });
 };
 
 /**
- * Emite una notificación broadcast a todos los usuarios conectados.
+ * Emite una notificación broadcast a todos los usuarios de un tenant específico.
+ * Si no se pasa tenant, emite a todos los conectados.
  */
-const emitBroadcast = (notification) => {
+const emitBroadcast = (notification, tenant) => {
     const io = getIO();
-    io.emit('broadcast-notification', notification);
+    if (tenant) {
+        const rooms = io.sockets.adapter.rooms;
+        for (const [roomName] of rooms) {
+            if (roomName.startsWith(`user:${tenant}:`)) {
+                io.to(roomName).emit('broadcast-notification', notification);
+            }
+        }
+    } else {
+        io.emit('broadcast-notification', notification);
+    }
 };
 
 module.exports = { emitToUser, emitUnreadCount, emitBroadcast };

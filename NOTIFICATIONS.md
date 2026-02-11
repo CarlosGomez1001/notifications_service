@@ -20,9 +20,10 @@ Servicio independiente para notificaciones en tiempo real y persistencia de aler
 │                                                                         │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │  Socket.io Client                                                 │  │
-│  │  connect → register(userId) → escuchar 'new-notification'        │  │
+│  │  connect → register({ userId, tenant }) → 'new-notification'     │  │
+│  │  tenant = state.auth.direct (nombre de base de datos)            │  │
 │  │                                                                   │  │
-│  │  REST: GET /api/notifications/:userId                             │  │
+│  │  REST: GET /api/notifications/:tenant/:userId                     │  │
 │  │  REST: PATCH /api/notifications/:id/read                          │  │
 │  └────────────────────────────┬──────────────────────────────────────┘  │
 └───────────────────────────────┼─────────────────────────────────────────┘
@@ -43,15 +44,16 @@ Servicio independiente para notificaciones en tiempo real y persistencia de aler
 │  │  POST /api/notifications/send          ← Backend PHP (API Key)     │ │
 │  │  POST /api/notifications/send-bulk     ← Backend PHP (API Key)     │ │
 │  │  POST /api/notifications/broadcast     ← Backend PHP (API Key)     │ │
-│  │  GET  /api/notifications/:userId       ← Frontend (público)        │ │
-│  │  GET  /api/notifications/:userId/unread-count                      │ │
+│  │  GET  /api/notifications/:tenant/:userId       ← Frontend          │ │
+│  │  GET  /api/notifications/:tenant/:userId/unread-count              │ │
 │  │  PATCH /api/notifications/:id/read                                 │ │
-│  │  PATCH /api/notifications/:userId/read-all                         │ │
+│  │  PATCH /api/notifications/:tenant/:userId/read-all                 │ │
 │  │                                                                    │ │
+│  │  Socket.io Rooms: user:{tenant}:{userId}                          │ │
 │  │  Socket.io Events:                                                 │ │
-│  │    → 'new-notification'      (al usuario destino)                  │ │
+│  │    → 'new-notification'      (al usuario en su tenant)             │ │
 │  │    → 'unread-count'          (actualización de badge)              │ │
-│  │    → 'broadcast-notification' (a todos)                            │ │
+│  │    → 'broadcast-notification' (a todos o por tenant)               │ │
 │  └────────────────────────────┬───────────────────────────────────────┘ │
 │                               │                                         │
 │  ┌────────────────────────────▼───────────────────────────────────────┐ │
@@ -112,6 +114,40 @@ curl http://localhost:3002/notifications/health
 # {"status":"ok","service":"notifications","uptime":12.345}
 ```
 
+## Multi-Tenancy
+
+El microservicio es **multi-tenant**: todas las notificaciones están aisladas por `tenant`, que corresponde al nombre de la base de datos del cliente (equivalente a `state.auth.direct` en el frontend y `database` en el payload JWT del backend).
+
+### Cómo funciona el aislamiento
+
+| Capa | Mecanismo |
+|---|---|
+| **MongoDB** | Cada documento `Notification` tiene un campo `tenant` (requerido, indexado). Todas las consultas filtran por `tenant`. |
+| **API REST (público)** | El `tenant` es parte de la URL: `/:tenant/:userId`. El frontend lo obtiene de `state.auth.direct`. |
+| **API REST (protegido)** | El `tenant` se envía en el body de los POST (`/send`, `/send-bulk`). El backend lo obtiene del JWT (`database`). |
+| **WebSocket** | Cada socket se registra con `{ userId, tenant }`. El room tiene formato `user:{tenant}:{userId}`, impidiendo que usuarios de un tenant reciban notificaciones de otro. |
+
+### Diagrama de aislamiento
+
+```
+Tenant A (bd: empresa_a)              Tenant B (bd: empresa_b)
+┌─────────────────────────┐           ┌─────────────────────────┐
+│ Room: user:empresa_a:42 │           │ Room: user:empresa_b:42 │
+│ Room: user:empresa_a:15 │           │ Room: user:empresa_b:7  │
+└─────────────────────────┘           └─────────────────────────┘
+         ↓                                      ↓
+   Notificaciones con                    Notificaciones con
+   tenant="empresa_a"                    tenant="empresa_b"
+         ↓                                      ↓
+         └──────────── MongoDB ─────────────────┘
+                    (misma colección,
+                     filtrado por tenant)
+```
+
+> **Importante:** Un mismo `userId` (ej. `42`) puede existir en múltiples tenants. El par `(tenant, userId)` es lo que identifica de forma única a un usuario en el sistema de notificaciones.
+
+---
+
 ## API Reference
 
 ### Endpoints protegidos (API Key)
@@ -133,6 +169,7 @@ Content-Type: application/json
 **Body:**
 ```json
 {
+    "tenant": "nombre_base_datos",
     "recipientId": "42",
     "senderId": "7",
     "type": "manual",
@@ -148,6 +185,7 @@ Content-Type: application/json
 
 | Campo | Tipo | Requerido | Descripción |
 |---|---|---|---|
+| `tenant` | string | **Si** | Nombre de la base de datos del cliente (aislamiento multi-tenant) |
 | `recipientId` | string | Si | IdEmpleado del usuario destino |
 | `senderId` | string | No | IdEmpleado del usuario origen (null = sistema) |
 | `type` | string | No | `manual`, `system`, `reminder`, `alert` (default: `manual`) |
@@ -163,6 +201,7 @@ Content-Type: application/json
     "message": "Notificacion enviada",
     "data": {
         "_id": "65a1b2c3d4e5f6...",
+        "tenant": "nombre_base_datos",
         "recipientId": "42",
         "senderId": "7",
         "type": "manual",
@@ -187,6 +226,7 @@ Envía la misma notificación a múltiples usuarios.
 **Body:**
 ```json
 {
+    "tenant": "nombre_base_datos",
     "recipientIds": ["42", "15", "8"],
     "type": "system",
     "module": "general",
@@ -204,11 +244,14 @@ Envía un evento a todos los usuarios conectados por WebSocket (sin persistir en
 **Body:**
 ```json
 {
+    "tenant": "nombre_base_datos",
     "type": "alert",
     "title": "Actualización del sistema",
     "message": "Se ha desplegado la versión 2.5.0."
 }
 ```
+
+> **Nota:** `tenant` es **opcional** en broadcast. Si se proporciona, solo se emite a los usuarios conectados de ese tenant. Si se omite, se emite a **todos** los usuarios conectados.
 
 ---
 
@@ -216,9 +259,15 @@ Envía un evento a todos los usuarios conectados por WebSocket (sin persistir en
 
 ---
 
-#### `GET /api/notifications/:userId`
+#### `GET /api/notifications/:tenant/:userId`
 
-Obtiene las notificaciones de un usuario con paginación.
+Obtiene las notificaciones de un usuario dentro de su tenant, con paginación.
+
+**Path params:**
+| Param | Descripción |
+|---|---|
+| `tenant` | Nombre de la base de datos (= `state.auth.direct` en el frontend) |
+| `userId` | IdEmpleado del usuario |
 
 **Query params:**
 | Param | Default | Descripción |
@@ -229,7 +278,7 @@ Obtiene las notificaciones de un usuario con paginación.
 
 **Ejemplo:**
 ```
-GET /api/notifications/42?page=1&limit=10&unread=true
+GET /api/notifications/empresa_a/42?page=1&limit=10&unread=true
 ```
 
 **Respuesta:**
@@ -248,9 +297,9 @@ GET /api/notifications/42?page=1&limit=10&unread=true
 
 ---
 
-#### `GET /api/notifications/:userId/unread-count`
+#### `GET /api/notifications/:tenant/:userId/unread-count`
 
-Devuelve el conteo de notificaciones no leídas.
+Devuelve el conteo de notificaciones no leídas del usuario dentro de su tenant.
 
 ```json
 { "success": true, "data": { "count": 12 } }
@@ -264,9 +313,9 @@ Marca una notificación individual como leída (`:id` es el `_id` de MongoDB).
 
 ---
 
-#### `PATCH /api/notifications/:userId/read-all`
+#### `PATCH /api/notifications/:tenant/:userId/read-all`
 
-Marca todas las notificaciones del usuario como leídas.
+Marca todas las notificaciones del usuario dentro de su tenant como leídas.
 
 ---
 
@@ -313,10 +362,11 @@ it_web_service-Front/src/
 3. NotificationBell usa useNotifications()
    ↓
 4. useNotifications():
-   ├── Lee IdEmpleado del Redux state.auth
-   ├── Conecta Socket.io y emite 'register' con IdEmpleado
+   ├── Lee IdEmpleado y direct (tenant) del Redux state.auth
+   ├── Conecta Socket.io y emite 'register' con { userId: IdEmpleado, tenant: direct }
+   ├── El servidor une al socket al room "user:{tenant}:{userId}"
    ├── Escucha eventos: 'new-notification', 'unread-count', 'broadcast-notification'
-   ├── Despacha fetchNotifications() y fetchUnreadCount() (carga inicial)
+   ├── Despacha fetchNotifications(tenant, userId) y fetchUnreadCount(tenant, userId)
    └── Al desmontar: disconnectNotifications() + clearNotifications()
    ↓
 5. Cuando llega un evento WebSocket:
@@ -327,13 +377,15 @@ it_web_service-Front/src/
 6. Usuario interactua:
    ├── Click en campana → abre/cierra NotificationPanel
    ├── Click en notificación → markAsRead + navegar a metadata.route (deep-link)
-   ├── "Marcar todas como leidas" → markAllAsRead → badge se pone en 0
-   └── "Cargar mas" → fetchMoreNotifications (paginación)
+   ├── "Marcar todas como leidas" → markAllAsRead(tenant, userId) → badge se pone en 0
+   └── "Cargar mas" → fetchMoreNotifications (paginación con tenant)
    ↓
 7. Usuario hace logout:
-   ├── disconnectNotifications() → cierra socket
+   ├── disconnectNotifications() → cierra socket (sale del room)
    └── clearNotifications() → limpia Redux state
 ```
+
+> **Nota:** El `tenant` se obtiene de `state.auth.direct`, que corresponde al nombre de la base de datos seleccionada durante el login. Todas las llamadas REST y el registro del socket incluyen este valor para garantizar el aislamiento multi-tenant.
 
 ### Uso del hook useNotifications
 
@@ -396,8 +448,9 @@ NOTIFICATIONS_API_KEY=changeme-generate-a-secure-key
 ```php
 use Classes\NotificationService;
 
-// Enviar a un usuario
+// Enviar a un usuario (tenant = nombre de base de datos del JWT)
 NotificationService::send(
+    tenant: $dataTokenDecoded['database'],  // REQUERIDO: aislamiento multi-tenant
     recipientId: '42',
     title: 'Nueva cotización asignada',
     message: 'Se te asignó la cotización #1234',
@@ -409,6 +462,7 @@ NotificationService::send(
 
 // Enviar a multiples usuarios
 NotificationService::sendBulk(
+    tenant: $dataTokenDecoded['database'],  // REQUERIDO
     recipientIds: ['42', '15', '8'],
     title: 'Mantenimiento programado',
     message: 'El sistema estará en mantenimiento el sábado.',
@@ -416,12 +470,15 @@ NotificationService::sendBulk(
     type: 'system'
 );
 
-// Broadcast a todos los conectados
+// Broadcast a todos los conectados (tenant opcional)
 NotificationService::broadcast(
     title: 'Actualización del sistema',
-    message: 'Se ha desplegado la versión 2.5.0.'
+    message: 'Se ha desplegado la versión 2.5.0.',
+    tenant: $dataTokenDecoded['database']  // Opcional: si se omite, llega a TODOS los tenants
 );
 ```
+
+> **Importante:** El `tenant` se obtiene del campo `database` del JWT decodificado (`$dataTokenDecoded['database']`). Este valor es el mismo que `state.auth.direct` en el frontend.
 
 ### Ejemplo: CRMController - Notificar al crear cotización
 
@@ -443,13 +500,14 @@ public static function insertCotizacion_v2(): void
     if ($resultado['success']) {
         // Notificar al vendedor asignado
         NotificationService::send(
-            $data['IdEmpleado'],
-            'Nueva cotización asignada',
-            "Se te asignó la cotización #{$resultado['data']['IdCotizacion']} del cliente {$data['RazonSocial']}",
-            'crm',
-            'system',
-            $dataTokenDecoded[0]->IdEmpleado,  // senderId: quien creo la cotización
-            ['route' => "/crmModulo/cotizacion/{$resultado['data']['IdCotizacion']}"]
+            tenant: $dataTokenDecoded['database'],  // Tenant del JWT
+            recipientId: $data['IdEmpleado'],
+            title: 'Nueva cotización asignada',
+            message: "Se te asignó la cotización #{$resultado['data']['IdCotizacion']} del cliente {$data['RazonSocial']}",
+            module: 'crm',
+            type: 'system',
+            senderId: $dataTokenDecoded[0]->IdEmpleado,  // quien creo la cotización
+            metadata: ['route' => "/crmModulo/cotizacion/{$resultado['data']['IdCotizacion']}"]
         );
     }
 
@@ -472,13 +530,13 @@ public static function setStateRfso(): void
     if ($resultado) {
         // Notificar al operador de logística
         NotificationService::send(
-            $idEmpleadoOperador,
-            'RFSO actualizado',
-            "El RFSO #{$idRfso} fue marcado como entregado",
-            'logistica',
-            'system',
-            null,
-            ['route' => "/logisticaModulo/entregas/{$idOrd}/{$idRfso}"]
+            tenant: $bd,  // Tenant (base de datos del JWT)
+            recipientId: $idEmpleadoOperador,
+            title: 'RFSO actualizado',
+            message: "El RFSO #{$idRfso} fue marcado como entregado",
+            module: 'logistica',
+            type: 'system',
+            metadata: ['route' => "/logisticaModulo/entregas/{$idOrd}/{$idRfso}"]
         );
     }
 
@@ -500,13 +558,14 @@ public static function CreateOT(): void
     if ($resultado[0]) {
         // Notificar al técnico asignado
         NotificationService::send(
-            $data['IdEmpleadoTecnico'],
-            'Nueva Orden de Trabajo',
-            "Se te asignó la OT #{$resultado[1]} para el equipo {$data['NombreEquipo']}",
-            'mtto',
-            'system',
-            $dataTokenDecoded[0]->IdEmpleado,
-            ['route' => "/mttoModulo/ordenes/{$resultado[1]}/{$data['IdEquipo']}"]
+            tenant: $dataTokenDecoded['database'],  // Tenant del JWT
+            recipientId: $data['IdEmpleadoTecnico'],
+            title: 'Nueva Orden de Trabajo',
+            message: "Se te asignó la OT #{$resultado[1]} para el equipo {$data['NombreEquipo']}",
+            module: 'mtto',
+            type: 'system',
+            senderId: $dataTokenDecoded[0]->IdEmpleado,
+            metadata: ['route' => "/mttoModulo/ordenes/{$resultado[1]}/{$data['IdEquipo']}"]
         );
     }
 
@@ -521,13 +580,13 @@ use Classes\NotificationService;
 
 // Desde un script PHP ejecutado por cron o un endpoint de sistema
 NotificationService::sendBulk(
-    ['42', '15', '8', '23'],
-    'Recordatorio: Revisión semanal',
-    'Recuerda completar tu revisión semanal de equipos asignados antes del viernes.',
-    'mtto',
-    'reminder',
-    null,
-    ['route' => '/mttoModulo']
+    tenant: 'nombre_base_datos',  // Tenant específico
+    recipientIds: ['42', '15', '8', '23'],
+    title: 'Recordatorio: Revisión semanal',
+    message: 'Recuerda completar tu revisión semanal de equipos asignados antes del viernes.',
+    module: 'mtto',
+    type: 'reminder',
+    metadata: ['route' => '/mttoModulo']
 );
 ```
 
@@ -545,12 +604,13 @@ public static function enviarNotificacionManual(): void
     $dataTokenDecoded = validadorTokenCrm($headers['Authorization'], $headers['X-Refresh-Token']);
 
     NotificationService::send(
-        $data['recipientId'],
-        $data['title'],
-        $data['message'],
-        $data['module'] ?? 'general',
-        'manual',
-        $dataTokenDecoded[0]->IdEmpleado   // El que envia
+        tenant: $dataTokenDecoded['database'],  // Tenant del JWT
+        recipientId: $data['recipientId'],
+        title: $data['title'],
+        message: $data['message'],
+        module: $data['module'] ?? 'general',
+        type: 'manual',
+        senderId: $dataTokenDecoded[0]->IdEmpleado   // El que envia
     );
 
     HTTPreponse(1, 200, "Notificacion enviada");
@@ -640,6 +700,7 @@ microservices/notifications/
 ```javascript
 {
     _id:          ObjectId,
+    tenant:       String,       // Nombre de base de datos (requerido, aislamiento multi-tenant)
     recipientId:  String,       // IdEmpleado destino
     senderId:     String|null,  // IdEmpleado origen (null = sistema)
     type:         "manual" | "system" | "reminder" | "alert",
@@ -655,18 +716,19 @@ microservices/notifications/
 ```
 
 **Indices:**
+- `tenant` (simple) - Filtro por tenant
 - `recipientId` (simple) - Consultas por usuario
 - `read` (simple) - Filtro leído/no leído
-- `{ recipientId, read, createdAt }` (compuesto) - Consulta principal del frontend
+- `{ tenant, recipientId, read, createdAt }` (compuesto) - Consulta principal del frontend (todas las queries filtran por tenant + usuario)
 
 ## Eventos WebSocket
 
 | Evento | Dirección | Payload | Descripción |
 |---|---|---|---|
-| `register` | Cliente → Servidor | `userId` (string) | Registra al usuario para recibir sus notificaciones |
-| `new-notification` | Servidor → Cliente | `Notification` (objeto completo) | Nueva notificación individual |
-| `unread-count` | Servidor → Cliente | `{ count: number }` | Actualización del badge de no leídas |
-| `broadcast-notification` | Servidor → Todos | `Notification` (sin _id) | Mensaje global a todos los conectados |
+| `register` | Cliente → Servidor | `{ userId, tenant }` | Registra al usuario en el room `user:{tenant}:{userId}` |
+| `new-notification` | Servidor → Cliente | `Notification` (objeto completo) | Nueva notificación individual (emitida al room del tenant+usuario) |
+| `unread-count` | Servidor → Cliente | `{ count: number }` | Actualización del badge de no leídas (scoped por tenant) |
+| `broadcast-notification` | Servidor → Todos/Tenant | `Notification` (sin _id) | Si se proporcionó tenant: solo a rooms de ese tenant. Si no: a todos. |
 
 ## Seguridad
 

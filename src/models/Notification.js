@@ -2,6 +2,12 @@ const mongoose = require('mongoose');
 
 const notificationSchema = new mongoose.Schema(
     {
+        // Identificador del tenant (nombre de base de datos del cliente)
+        tenant: {
+            type: String,
+            required: true,
+            index: true,
+        },
         // Usuario destino (IdEmpleado del sistema principal)
         recipientId: {
             type: String,
@@ -55,7 +61,7 @@ const notificationSchema = new mongoose.Schema(
     }
 );
 
-// Índice compuesto para consultas frecuentes
-notificationSchema.index({ recipientId: 1, read: 1, createdAt: -1 });
+// Índice compuesto para consultas frecuentes (scoped por tenant)
+notificationSchema.index({ tenant: 1, recipientId: 1, read: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Notification', notificationSchema);

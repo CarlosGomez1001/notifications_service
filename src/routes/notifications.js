@@ -10,9 +10,10 @@ router.post('/send-bulk', apiKeyAuth, ctrl.sendBulkNotification);
 router.post('/broadcast', apiKeyAuth, ctrl.broadcastNotification);
 
 // ─── Rutas públicas (frontend consume directamente) ─────────────────────────
-router.get('/:userId', ctrl.getUserNotifications);
-router.get('/:userId/unread-count', ctrl.getUnreadCount);
+// Todas las rutas de lectura requieren tenant + userId para aislar datos entre clientes
+router.get('/:tenant/:userId', ctrl.getUserNotifications);
+router.get('/:tenant/:userId/unread-count', ctrl.getUnreadCount);
 router.patch('/:id/read', ctrl.markAsRead);
-router.patch('/:userId/read-all', ctrl.markAllAsRead);
+router.patch('/:tenant/:userId/read-all', ctrl.markAllAsRead);
 
 module.exports = router;

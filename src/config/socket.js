@@ -19,32 +19,47 @@ const initSocket = (httpServer) => {
         pingTimeout: 20000,
     });
 
-    // Mapa de usuarios conectados: userId -> Set<socketId>
+    // Mapa de usuarios conectados: "tenant:userId" -> Set<socketId>
     const connectedUsers = new Map();
 
     io.on('connection', (socket) => {
         console.log(`[WS] Cliente conectado: ${socket.id}`);
 
-        // El cliente envía su userId al conectarse
-        socket.on('register', (userId) => {
-            if (!userId) return;
+        // El cliente envía { userId, tenant } al conectarse
+        socket.on('register', (data) => {
+            // Soportar formato objeto { userId, tenant }
+            let userId, tenant;
+            if (typeof data === 'object' && data !== null) {
+                userId = data.userId;
+                tenant = data.tenant;
+            } else {
+                // Legacy: solo userId sin tenant — ignorar registro
+                return;
+            }
+
+            if (!userId || !tenant) return;
 
             socket.userId = String(userId);
+            socket.tenant = String(tenant);
+            const roomKey = `user:${socket.tenant}:${socket.userId}`;
 
-            if (!connectedUsers.has(socket.userId)) {
-                connectedUsers.set(socket.userId, new Set());
+            if (!connectedUsers.has(roomKey)) {
+                connectedUsers.set(roomKey, new Set());
             }
-            connectedUsers.get(socket.userId).add(socket.id);
+            connectedUsers.get(roomKey).add(socket.id);
 
-            socket.join(`user:${socket.userId}`);
-            console.log(`[WS] Usuario registrado: ${socket.userId} (socket: ${socket.id})`);
+            socket.join(roomKey);
+            console.log(`[WS] Usuario registrado: ${socket.tenant}:${socket.userId} (socket: ${socket.id})`);
         });
 
         socket.on('disconnect', () => {
-            if (socket.userId && connectedUsers.has(socket.userId)) {
-                connectedUsers.get(socket.userId).delete(socket.id);
-                if (connectedUsers.get(socket.userId).size === 0) {
-                    connectedUsers.delete(socket.userId);
+            if (socket.userId && socket.tenant) {
+                const roomKey = `user:${socket.tenant}:${socket.userId}`;
+                if (connectedUsers.has(roomKey)) {
+                    connectedUsers.get(roomKey).delete(socket.id);
+                    if (connectedUsers.get(roomKey).size === 0) {
+                        connectedUsers.delete(roomKey);
+                    }
                 }
             }
             console.log(`[WS] Cliente desconectado: ${socket.id}`);
