@@ -18,15 +18,16 @@ const emitUnreadCount = (tenant, recipientId, count) => {
 };
 
 /**
- * Emite una notificación broadcast a todos los usuarios de un tenant específico.
- * Si no se pasa tenant, emite a todos los conectados.
+ * Emite una notificación broadcast a los usuarios de uno o varios tenants.
+ * `tenants` puede ser un string, un array de strings, o null/undefined para emitir a todos los conectados.
  */
-const emitBroadcast = (notification, tenant) => {
+const emitBroadcast = (notification, tenants) => {
     const io = getIO();
-    if (tenant) {
+    if (tenants) {
+        const prefixes = (Array.isArray(tenants) ? tenants : [tenants]).map((tenant) => `user:${tenant}:`);
         const rooms = io.sockets.adapter.rooms;
         for (const [roomName] of rooms) {
-            if (roomName.startsWith(`user:${tenant}:`)) {
+            if (prefixes.some((prefix) => roomName.startsWith(prefix))) {
                 io.to(roomName).emit('broadcast-notification', notification);
             }
         }

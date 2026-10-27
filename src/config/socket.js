@@ -1,12 +1,19 @@
 const { Server } = require('socket.io');
 const config = require('./env');
+const { verifyNotificationToken } = require('../services/tokenService');
 
 let io = null;
 
 /**
  * Inicializa Socket.io sobre el servidor HTTP existente.
- * Mantiene un mapa interno `userId -> Set<socketId>` para
- * poder enviar notificaciones dirigidas a usuarios específicos.
+ *
+ * Autenticación: el cliente se conecta con `auth: { token }` (token de
+ * notificaciones emitido por el backend). La identidad (tenant + userId) sale
+ * del token verificado; el cliente ya no puede declararla. Cada socket se une
+ * automáticamente al room `user:{tenant}:{userId}`.
+ *
+ * Expiración: al vencer el token el servidor emite `token-expired` y cierra el
+ * socket. El cliente solicita un token nuevo y reconecta (ver notificationSocket.js).
  */
 const initSocket = (httpServer) => {
     io = new Server(httpServer, {
@@ -19,50 +26,35 @@ const initSocket = (httpServer) => {
         pingTimeout: 20000,
     });
 
-    // Mapa de usuarios conectados: "tenant:userId" -> Set<socketId>
-    const connectedUsers = new Map();
+    // ─── Handshake: rechaza conexiones sin token válido ─────────────────────
+    io.use((socket, next) => {
+        try {
+            socket.data.auth = verifyNotificationToken(socket.handshake.auth?.token);
+            next();
+        } catch (error) {
+            const err = new Error(error.message);
+            err.data = { code: error.code };
+            next(err);
+        }
+    });
 
     io.on('connection', (socket) => {
-        console.log(`[WS] Cliente conectado: ${socket.id}`);
+        const { tenant, userId, exp } = socket.data.auth;
+        const roomKey = `user:${tenant}:${userId}`;
 
-        // El cliente envía { userId, tenant } al conectarse
-        socket.on('register', (data) => {
-            // Soportar formato objeto { userId, tenant }
-            let userId, tenant;
-            if (typeof data === 'object' && data !== null) {
-                userId = data.userId;
-                tenant = data.tenant;
-            } else {
-                // Legacy: solo userId sin tenant — ignorar registro
-                return;
-            }
+        socket.join(roomKey);
+        console.log(`[WS] Conectado ${tenant}:${userId} (socket: ${socket.id})`);
 
-            if (!userId || !tenant) return;
+        // Cierra el socket exactamente cuando vence el token para forzar la renovación.
+        const msUntilExpiry = Math.max(0, exp * 1000 - Date.now());
+        const expiryTimer = setTimeout(() => {
+            socket.emit('token-expired');
+            socket.disconnect(true);
+        }, msUntilExpiry);
 
-            socket.userId = String(userId);
-            socket.tenant = String(tenant);
-            const roomKey = `user:${socket.tenant}:${socket.userId}`;
-
-            if (!connectedUsers.has(roomKey)) {
-                connectedUsers.set(roomKey, new Set());
-            }
-            connectedUsers.get(roomKey).add(socket.id);
-
-            socket.join(roomKey);
-            console.log(`[WS] Usuario registrado: ${socket.tenant}:${socket.userId} (socket: ${socket.id})`);
-        });
-
-        socket.on('disconnect', () => {
-            if (socket.userId && socket.tenant) {
-                const roomKey = `user:${socket.tenant}:${socket.userId}`;
-                if (connectedUsers.has(roomKey)) {
-                    connectedUsers.get(roomKey).delete(socket.id);
-                    if (connectedUsers.get(roomKey).size === 0) {
-                        connectedUsers.delete(roomKey);
-                    }
-                }
-            }
-            console.log(`[WS] Cliente desconectado: ${socket.id}`);
+        socket.on('disconnect', (reason) => {
+            clearTimeout(expiryTimer);
+            console.log(`[WS] Desconectado ${tenant}:${userId} (${reason})`);
         });
     });
 

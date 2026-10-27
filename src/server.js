@@ -12,8 +12,10 @@ const app = express();
 const server = http.createServer(app);
 
 // ─── Middlewares ─────────────────────────────────────────────────────────────
+app.disable('x-powered-by');
 app.use(cors({ origin: config.corsOrigins }));
-app.use(express.json());
+// Límite de body: send-bulk/metadata no necesitan más; evita payloads abusivos
+app.use(express.json({ limit: '50kb' }));
 
 // ─── Health check ────────────────────────────────────────────────────────────
 app.get('/notifications/health', (_req, res) => {

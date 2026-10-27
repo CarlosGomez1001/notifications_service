@@ -1,5 +1,10 @@
 # Microservicio de Notificaciones
 
+> **v2 (seguridad para producción).** El navegador ya no declara su identidad ni conoce ninguna API key:
+> pide al backend un **token de notificaciones** (`GET /notificaciones/getToken`, 15 min) y el microservicio
+> toma `tenant` y `userId` de ese token, tanto en REST como en Socket.io. Las rutas `/:tenant/:userId` y el
+> evento `register` **ya no existen**. Detalle y justificación: `renew-plan-docs/notficaciones/` en la raíz del cluster.
+
 Servicio independiente para notificaciones en tiempo real y persistencia de alertas dentro del ecosistema IT Web Service.
 
 ## Stack
@@ -20,10 +25,10 @@ Servicio independiente para notificaciones en tiempo real y persistencia de aler
 │                                                                         │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │  Socket.io Client                                                 │  │
-│  │  connect → register({ userId, tenant }) → 'new-notification'     │  │
-│  │  tenant = state.auth.direct (nombre de base de datos)            │  │
+│  │  connect(auth: { token }) → 'new-notification'                    │  │
+│  │  token = GET /notificaciones/getToken (backend PHP, 15 min)       │  │
 │  │                                                                   │  │
-│  │  REST: GET /api/notifications/:tenant/:userId                     │  │
+│  │  REST: GET /api/notifications  (Authorization: Bearer <token>)    │  │
 │  │  REST: PATCH /api/notifications/:id/read                          │  │
 │  └────────────────────────────┬──────────────────────────────────────┘  │
 └───────────────────────────────┼─────────────────────────────────────────┘
@@ -44,10 +49,10 @@ Servicio independiente para notificaciones en tiempo real y persistencia de aler
 │  │  POST /api/notifications/send          ← Backend PHP (API Key)     │ │
 │  │  POST /api/notifications/send-bulk     ← Backend PHP (API Key)     │ │
 │  │  POST /api/notifications/broadcast     ← Backend PHP (API Key)     │ │
-│  │  GET  /api/notifications/:tenant/:userId       ← Frontend          │ │
-│  │  GET  /api/notifications/:tenant/:userId/unread-count              │ │
+│  │  GET  /api/notifications               ← Frontend (JWT notif.)     │ │
+│  │  GET  /api/notifications/unread-count                              │ │
 │  │  PATCH /api/notifications/:id/read                                 │ │
-│  │  PATCH /api/notifications/:tenant/:userId/read-all                 │ │
+│  │  PATCH /api/notifications/read-all                                 │ │
 │  │                                                                    │ │
 │  │  Socket.io Rooms: user:{tenant}:{userId}                          │ │
 │  │  Socket.io Events:                                                 │ │
@@ -82,14 +87,19 @@ Editar el archivo `.env` en la raíz del cluster:
 openssl rand -hex 32
 ```
 
-Copiar el resultado y pegarlo en `.env`:
+Copiar el resultado y pegarlo en `.env`. Se necesitan **dos secretos distintos** (y ninguno puede ser `SEC_KEY`):
 
 ```ini
-NOTIFICATIONS_API_KEY=<resultado_del_comando_anterior>
+NOTIFICATIONS_API_KEY=<openssl rand -hex 32>        # backend -> microservicio (/send, /send-bulk, /broadcast)
+NOTIFICATIONS_JWT_SECRET=<openssl rand -hex 32>     # con él el BACKEND firma el token del navegador (>= 32 chars)
 NOTIFICATIONS_CORS_ORIGINS=http://localhost:5173,http://localhost:80
 MS_NOTIFICATIONS_PORT=3002
 MONGO_NOTIFICATIONS_PORT=27017
 ```
+
+Los mismos `NOTIFICATIONS_API_KEY` y `NOTIFICATIONS_JWT_SECRET` (más `NOTIFICATIONS_URL` y, opcionalmente, las listas
+`NOTIFICATIONS_BROADCAST_*`) van en el `.env` del **backend** (ver su `.env.example`). El servicio **no arranca** si faltan,
+si usan el placeholder `changeme…`, si tienen menos de 32 caracteres o si son iguales entre sí.
 
 ### 2. Levantar el servicio
 
@@ -116,16 +126,16 @@ curl http://localhost:3002/notifications/health
 
 ## Multi-Tenancy
 
-El microservicio es **multi-tenant**: todas las notificaciones están aisladas por `tenant`, que corresponde al nombre de la base de datos del cliente (equivalente a `state.auth.direct` en el frontend y `database` en el payload JWT del backend).
+El microservicio es **multi-tenant**: todas las notificaciones están aisladas por `tenant`, que corresponde al nombre de la base de datos del cliente (equivalente a `database` en el JWT de sesión del backend; viaja como claim `tenant` del token de notificaciones).
 
 ### Cómo funciona el aislamiento
 
 | Capa | Mecanismo |
 |---|---|
 | **MongoDB** | Cada documento `Notification` tiene un campo `tenant` (requerido, indexado). Todas las consultas filtran por `tenant`. |
-| **API REST (público)** | El `tenant` es parte de la URL: `/:tenant/:userId`. El frontend lo obtiene de `state.auth.direct`. |
+| **API REST (usuario)** | `tenant` y `userId` salen del **token de notificaciones** (claims `tenant` y `sub`), nunca de la URL ni del body. |
 | **API REST (protegido)** | El `tenant` se envía en el body de los POST (`/send`, `/send-bulk`). El backend lo obtiene del JWT (`database`). |
-| **WebSocket** | Cada socket se registra con `{ userId, tenant }`. El room tiene formato `user:{tenant}:{userId}`, impidiendo que usuarios de un tenant reciban notificaciones de otro. |
+| **WebSocket** | El handshake exige `auth.token`; el servidor une el socket al room `user:{tenant}:{userId}` derivado del token. El cliente no puede registrarse como otro usuario. |
 
 ### Diagrama de aislamiento
 
@@ -145,6 +155,30 @@ Tenant A (bd: empresa_a)              Tenant B (bd: empresa_b)
 ```
 
 > **Importante:** Un mismo `userId` (ej. `42`) puede existir en múltiples tenants. El par `(tenant, userId)` es lo que identifica de forma única a un usuario en el sistema de notificaciones.
+
+---
+
+## Autenticación
+
+Hay dos mecanismos, para dos tipos de llamador:
+
+| Llamador | Rutas | Credencial |
+|---|---|---|
+| Backend PHP (red Docker interna) | `POST /send`, `/send-bulk`, `/broadcast` | Header `x-api-key` (comparación en tiempo constante) |
+| Navegador | `GET /`, `GET /unread-count`, `PATCH /:id/read`, `PATCH /read-all` y el socket | `Authorization: Bearer <token de notificaciones>` / `auth: { token }` |
+
+**Token de notificaciones** – lo emite el backend (`GET /notificaciones/getToken`, requiere sesión válida):
+HS256 firmado con `NOTIFICATIONS_JWT_SECRET`; claims `iss=it-backend`, `aud=it-notifications`, `sub=<IdEmpleado>`,
+`tenant=<BD del cliente>`, `exp` = +15 min. El microservicio verifica firma, `iss`, `aud`, `exp` y formato de `tenant`/`sub`.
+Errores 401 llevan `code`: `TOKEN_MISSING` | `TOKEN_INVALID` | `TOKEN_EXPIRED`.
+
+**Expiración y reconexión** – al llegar `exp` el servidor emite `token-expired` y cierra el socket
+(`io server disconnect`). El cliente pide un token nuevo y reconecta (en el frontend: `src/services/notificationSocket.js`).
+`auth` se evalúa en cada intento, así que toda reconexión usa un token vigente.
+
+**Exposición pública** – `/send`, `/send-bulk` y `/broadcast` **no deben publicarse** en el proxy de internet
+(`nginx/nginx.conf` y el snippet de `renew-plan-docs/notficaciones/` responden 404). El navegador envía mensajes
+**a través del backend** (`POST /notificaciones/enviar`, `POST /notificaciones/broadcast`), que valida la sesión.
 
 ---
 
@@ -251,23 +285,24 @@ Envía un evento a todos los usuarios conectados por WebSocket (sin persistir en
 }
 ```
 
-> **Nota:** `tenant` es **opcional** en broadcast. Si se proporciona, solo se emite a los usuarios conectados de ese tenant. Si se omite, se emite a **todos** los usuarios conectados.
+> **Nota:** el destino es opcional y se elige con **uno** de estos campos (enviar ambos responde `400`):
+> - `tenant` (string): solo a los usuarios conectados de ese tenant.
+> - `tenants` (array de 1 a 200 strings, sin duplicados): a los usuarios conectados de esos tenants.
+> - ninguno: a **todos** los usuarios conectados.
+>
+> El microservicio no decide quién puede hacerlo: lo autoriza el backend (`POST /notificaciones/broadcast`).
 
 ---
 
-### Endpoints públicos (Frontend)
+### Endpoints del usuario (JWT de notificaciones)
+
+Todos requieren `Authorization: Bearer <token de notificaciones>`. El usuario y el tenant son los del token.
 
 ---
 
-#### `GET /api/notifications/:tenant/:userId`
+#### `GET /api/notifications`
 
-Obtiene las notificaciones de un usuario dentro de su tenant, con paginación.
-
-**Path params:**
-| Param | Descripción |
-|---|---|
-| `tenant` | Nombre de la base de datos (= `state.auth.direct` en el frontend) |
-| `userId` | IdEmpleado del usuario |
+Notificaciones del usuario autenticado, con paginación.
 
 **Query params:**
 | Param | Default | Descripción |
@@ -276,30 +311,20 @@ Obtiene las notificaciones de un usuario dentro de su tenant, con paginación.
 | `limit` | 20 | Registros por página (max 50) |
 | `unread` | false | Si `true`, solo devuelve no leídas |
 
-**Ejemplo:**
-```
-GET /api/notifications/empresa_a/42?page=1&limit=10&unread=true
-```
+**Ejemplo:** `GET /api/notifications?page=1&limit=10&unread=true`
 
 **Respuesta:**
 ```json
 {
     "success": true,
     "data": [ ... ],
-    "pagination": {
-        "page": 1,
-        "limit": 10,
-        "total": 45,
-        "pages": 5
-    }
+    "pagination": { "page": 1, "limit": 10, "total": 45, "pages": 5 }
 }
 ```
 
 ---
 
-#### `GET /api/notifications/:tenant/:userId/unread-count`
-
-Devuelve el conteo de notificaciones no leídas del usuario dentro de su tenant.
+#### `GET /api/notifications/unread-count`
 
 ```json
 { "success": true, "data": { "count": 12 } }
@@ -309,13 +334,29 @@ Devuelve el conteo de notificaciones no leídas del usuario dentro de su tenant.
 
 #### `PATCH /api/notifications/:id/read`
 
-Marca una notificación individual como leída (`:id` es el `_id` de MongoDB).
+Marca una notificación **propia** como leída (`:id` = `_id` de MongoDB). Si la notificación es de otro usuario o de
+otro tenant responde `404` (no revela su existencia). `400` si el `id` no es un ObjectId.
 
 ---
 
-#### `PATCH /api/notifications/:tenant/:userId/read-all`
+#### `PATCH /api/notifications/read-all`
 
-Marca todas las notificaciones del usuario dentro de su tenant como leídas.
+Marca como leídas todas las notificaciones del usuario autenticado.
+
+---
+
+#### `GET /notifications/health`
+
+Health check (sin autenticación).
+
+---
+
+### Validación de entrada (rutas de API key)
+
+`tenant`, `recipientId`, `senderId` deben ser string/número con formato `^[\w.\-]{1,128}$` (los objetos tipo `{"$ne":null}` se rechazan);
+`title` ≤ 200, `message` ≤ 1000, `type` ∈ `manual|system|reminder|alert`, `module` ∈ `crm|logistica|mtto|general`;
+`metadata` objeto ≤ 4 KB y, si trae `route`, debe iniciar con `/` (no `//`); `send-bulk` ≤ 500 destinatarios (se deduplican);
+body JSON ≤ 50 KB. Errores de validación responden `400`.
 
 ---
 
@@ -328,12 +369,13 @@ La integración frontend ya está implementada y conectada al ecosistema existen
 ```
 it_web_service-Front/src/
 ├── global/
-│   └── notificationsURL.js                          # URL base del microservicio
+│   └── notificationsURL.js                          # URL base (VITE_NOTIFICATIONS_URL; vacía = mismo origen)
 ├── services/
-│   └── notificationSocket.js                        # Cliente Socket.io (connect/disconnect/getSocket)
+│   ├── notificationsAuth.js                         # Token de notificaciones (caché/renovación) + fetch autenticado
+│   └── notificationSocket.js                        # Cliente Socket.io (auth con función, reconexión al expirar)
 ├── store/slices/notificationsSlice/
 │   ├── notificationsSlice.js                        # Redux slice (state + reducers)
-│   ├── notificationsThunks.js                       # Thunks (fetch, markRead, sendManual)
+│   ├── notificationsThunks.js                       # Thunks (fetch, markRead) + envío manual/broadcast vía backend
 │   └── index.js                                     # Barrel export
 └── app/
     ├── hooks/
@@ -362,11 +404,11 @@ it_web_service-Front/src/
 3. NotificationBell usa useNotifications()
    ↓
 4. useNotifications():
-   ├── Lee IdEmpleado y direct (tenant) del Redux state.auth
-   ├── Conecta Socket.io y emite 'register' con { userId: IdEmpleado, tenant: direct }
-   ├── El servidor une al socket al room "user:{tenant}:{userId}"
+   ├── Espera sesión (IdEmpleado y direct en Redux state.auth)
+   ├── Pide el token al backend (GET /notificaciones/getToken) y conecta Socket.io con auth: { token }
+   ├── El servidor une al socket al room "user:{tenant}:{userId}" tomado del token
    ├── Escucha eventos: 'new-notification', 'unread-count', 'broadcast-notification'
-   ├── Despacha fetchNotifications(tenant, userId) y fetchUnreadCount(tenant, userId)
+   ├── Despacha fetchNotifications() y fetchUnreadCount() (Bearer; el servidor filtra por el token)
    └── Al desmontar: disconnectNotifications() + clearNotifications()
    ↓
 5. Cuando llega un evento WebSocket:
@@ -377,15 +419,17 @@ it_web_service-Front/src/
 6. Usuario interactua:
    ├── Click en campana → abre/cierra NotificationPanel
    ├── Click en notificación → markAsRead + navegar a metadata.route (deep-link)
-   ├── "Marcar todas como leidas" → markAllAsRead(tenant, userId) → badge se pone en 0
-   └── "Cargar mas" → fetchMoreNotifications (paginación con tenant)
+   ├── "Marcar todas como leidas" → markAllAsRead() → badge se pone en 0
+   └── "Cargar mas" → fetchMoreNotifications (paginación)
    ↓
 7. Usuario hace logout:
    ├── disconnectNotifications() → cierra socket (sale del room)
    └── clearNotifications() → limpia Redux state
 ```
 
-> **Nota:** El `tenant` se obtiene de `state.auth.direct`, que corresponde al nombre de la base de datos seleccionada durante el login. Todas las llamadas REST y el registro del socket incluyen este valor para garantizar el aislamiento multi-tenant.
+> **Nota:** El `tenant` ya no lo envía el navegador: el backend lo toma de la sesión (`database` del JWT) y lo firma dentro del token de notificaciones. Así el aislamiento multi-tenant no depende de datos controlados por el cliente.
+>
+> Al vencer el token (15 min) el servidor cierra el socket; el cliente obtiene uno nuevo, reconecta y vuelve a cargar lista y contador.
 
 ### Uso del hook useNotifications
 
@@ -411,12 +455,13 @@ const MiComponente = () => {
 
 ### Configurar URL en produccion
 
-Editar `src/global/notificationsURL.js`:
+La URL se inyecta en build con `VITE_NOTIFICATIONS_URL` (ver `Dockerfile.prod` y `docker-compose.yml`).
+Front, backend y microservicio comparten host (`https://crm.itwebservices.net`), así que en producción se deja
+**vacía** (= mismo origen) y el proxy del servidor enruta `/api/notifications` y `/notifications/socket.io`
+al microservicio (snippet en `renew-plan-docs/notficaciones/nginx-servidor-crm.snippet.conf`).
+En desarrollo, si no se define, usa `http://localhost:3002`.
 
-```javascript
-// export const NOTIFICATIONS_URL = 'http://localhost:3002'; //* Local
-export const NOTIFICATIONS_URL = 'https://tu-dominio.com'; //* Produccion (Nginx proxea)
-```
+> Nunca definir secretos con prefijo `VITE_`: terminan en el bundle público.
 
 ### Socket.io client (ya incluido)
 
@@ -440,7 +485,11 @@ it_web_service-Backend_R/
 
 ```ini
 NOTIFICATIONS_URL=http://notifications:3002
-NOTIFICATIONS_API_KEY=changeme-generate-a-secure-key
+NOTIFICATIONS_API_KEY=<igual a NOTIFICATIONS_API_KEY del .env raíz>
+NOTIFICATIONS_JWT_SECRET=<igual a NOTIFICATIONS_JWT_SECRET del .env raíz; distinto de SEC_KEY>
+# Broadcast: lista blanca "tenant:Usuario" separada por comas (vacío = nadie)
+NOTIFICATIONS_BROADCAST_USERS=          # gerentes: solo su tenant
+NOTIFICATIONS_BROADCAST_GLOBAL_USERS=   # soporte: su tenant o todos
 ```
 
 ### API de la clase NotificationService
@@ -590,31 +639,16 @@ NotificationService::sendBulk(
 );
 ```
 
-### Ejemplo: Notificación manual (usuario a usuario)
+### Notificación manual (usuario a usuario) y broadcast
 
-```php
-use Classes\NotificationService;
+Ya no es un ejemplo: están implementados en `controllers/NotificacionesController.php` (+ `services/Notificaciones/NotificacionesService.php`):
 
-// Endpoint para que un usuario envie un mensaje a otro
-public static function enviarNotificacionManual(): void
-{
-    $headers = getallheaders();
-    $data = json_decode(file_get_contents("php://input"), true);
-
-    $dataTokenDecoded = validadorTokenCrm($headers['Authorization'], $headers['X-Refresh-Token']);
-
-    NotificationService::send(
-        tenant: $dataTokenDecoded['database'],  // Tenant del JWT
-        recipientId: $data['recipientId'],
-        title: $data['title'],
-        message: $data['message'],
-        module: $data['module'] ?? 'general',
-        type: 'manual',
-        senderId: $dataTokenDecoded[0]->IdEmpleado   // El que envia
-    );
-
-    HTTPreponse(1, 200, "Notificacion enviada");
-}
+| Ruta (backend) | Descripción |
+|---|---|
+| `GET /notificaciones/getToken` | Emite el token de notificaciones (15 min) para el usuario de la sesión |
+| `POST /notificaciones/enviar` | `{ recipientId, title, message, module?, metadata? }` → cualquier empleado **del mismo tenant**. `tenant` y remitente salen de la sesión |
+| `GET /notificaciones/getTenants` | Lista de clientes `[{ IdEmpresa, BaseDatos }]` (tabla maestra `Empresa`) para armar el selector de destinos. Solo soporte |
+| `POST /notificaciones/broadcast` | `{ title, message, scope, tenants?, module?, metadata? }`. `scope`: `"tenant"` (mi cliente), `"tenants"` (los de `tenants`, 1 o varios) o `"all"` (todos). **Solo soporte** (`NOTIFICATIONS_BROADCAST_GLOBAL_USERS`, entradas `tenant:Usuario`). El broadcast de gerentes (`NOTIFICATIONS_BROADCAST_USERS`) está **en pausa** |
 
 ---
 
@@ -681,9 +715,10 @@ microservices/notifications/
     ├── config/
     │   ├── env.js                      # Variables de entorno centralizadas
     │   ├── database.js                 # Conexión a MongoDB
-    │   └── socket.js                   # Configuración Socket.io + registro de usuarios
+    │   └── socket.js                   # Socket.io: handshake con JWT, room por token, cierre al expirar
     ├── middleware/
-    │   ├── apiKeyAuth.js               # Validación de API Key
+    │   ├── apiKeyAuth.js               # Validación de API Key (tiempo constante)
+    │   ├── jwtAuth.js                  # Valida el token de notificaciones -> req.auth
     │   └── errorHandler.js             # Manejo global de errores
     ├── models/
     │   └── Notification.js             # Schema de Mongoose (con índices)
@@ -691,8 +726,11 @@ microservices/notifications/
     │   └── notifications.js            # Definición de rutas Express
     ├── controllers/
     │   └── notificationController.js   # Lógica de negocio
-    └── services/
-        └── socketService.js            # Emisión de eventos WebSocket
+    ├── services/
+    │   ├── tokenService.js             # Verificación del token de notificaciones (HS256, iss, aud, exp)
+    │   └── socketService.js            # Emisión de eventos WebSocket
+    └── utils/
+        └── validators.js               # Validación/sanitización de entradas
 ```
 
 ## Modelo de datos (MongoDB)
@@ -725,24 +763,28 @@ microservices/notifications/
 
 | Evento | Dirección | Payload | Descripción |
 |---|---|---|---|
-| `register` | Cliente → Servidor | `{ userId, tenant }` | Registra al usuario en el room `user:{tenant}:{userId}` |
+| `token-expired` | Servidor → Cliente | — | El token venció; el servidor cierra el socket y el cliente debe pedir uno nuevo y reconectar |
 | `new-notification` | Servidor → Cliente | `Notification` (objeto completo) | Nueva notificación individual (emitida al room del tenant+usuario) |
 | `unread-count` | Servidor → Cliente | `{ count: number }` | Actualización del badge de no leídas (scoped por tenant) |
 | `broadcast-notification` | Servidor → Todos/Tenant | `Notification` (sin _id) | Si se proporcionó tenant: solo a rooms de ese tenant. Si no: a todos. |
 
 ## Seguridad
 
-- **API Key**: Los endpoints de escritura (`/send`, `/send-bulk`, `/broadcast`) requieren el header `x-api-key`. Solo el backend PHP debe conocer esta clave.
-- **CORS**: Configurado para aceptar solo los orígenes definidos en `CORS_ORIGINS`.
-- **Usuario no-root**: El contenedor se ejecuta como `appuser`, no como root.
-- **Red interna**: El microservicio se comunica con el backend via la red Docker interna (`it-web-service-network`), sin exponer MongoDB al host en producción.
+- **Dos credenciales distintas**: `x-api-key` (backend → microservicio) y token de notificaciones HS256 (navegador → microservicio), este último firmado por el backend con `NOTIFICATIONS_JWT_SECRET`, **distinto de `SEC_KEY`**: el microservicio no puede forjar sesiones del CRM.
+- **Identidad solo desde el token**: REST y WebSocket ignoran `tenant`/`userId` enviados por el cliente. `PATCH /:id/read` filtra por `_id + tenant + recipientId`.
+- **Sin secretos por defecto**: el servicio aborta si faltan `API_KEY`/`NOTIFICATIONS_JWT_SECRET`, son placeholder, < 32 caracteres o iguales; en producción exige `MONGO_URI` y `CORS_ORIGINS`.
+- **Rutas de servicio no públicas**: `/send`, `/send-bulk`, `/broadcast` se bloquean en el proxy (404) y solo se usan por la red Docker.
+- **Validación de entrada** y límite de body (ver *Validación de entrada*). `metadata.route` solo admite rutas internas.
+- **CORS**: solo los orígenes de `CORS_ORIGINS`.
+- **Usuario no-root** en el contenedor; Mongo con autenticación y puerto solo en loopback.
 
-### Recomendaciones para producción
+### Antes de salir a producción
 
-1. Cambiar `NOTIFICATIONS_API_KEY` por un valor generado con `openssl rand -hex 32`.
-2. Restringir `CORS_ORIGINS` al dominio real de producción.
-3. Eliminar el mapeo de puertos de MongoDB (`MONGO_NOTIFICATIONS_PORT`) para que no sea accesible desde fuera de Docker.
-4. Habilitar autenticación en MongoDB si se requiere mayor seguridad.
+1. Generar `NOTIFICATIONS_API_KEY` y `NOTIFICATIONS_JWT_SECRET` nuevos (`openssl rand -hex 32`) y **rotar** la contraseña de Mongo: el `.env` del microservicio estuvo versionado en el historial git.
+2. `NODE_ENV=production` y `NOTIFICATIONS_CORS_ORIGINS=https://crm.itwebservices.net`.
+3. Añadir los `location` del snippet al nginx del servidor y servir todo por HTTPS (el WebSocket requiere `wss`).
+4. Cargar en el `.env` del backend los mismos secretos y las listas `NOTIFICATIONS_BROADCAST_*`.
+5. Desplegar microservicio, backend y frontend **juntos** (las rutas `/:tenant/:userId` desaparecieron).
 
 ## Comandos útiles
 

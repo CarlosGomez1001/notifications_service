@@ -1,50 +1,36 @@
+const mongoose = require('mongoose');
 const Notification = require('../models/Notification');
 const { emitToUser, emitUnreadCount, emitBroadcast } = require('../services/socketService');
+const { asId, asIdList, parseNotificationBody, MAX_BULK_RECIPIENTS, MAX_BROADCAST_TENANTS } = require('../utils/validators');
+
+const badRequest = (res, message) => res.status(400).json({ success: false, message });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Rutas protegidas por API Key (las invoca únicamente el backend PHP)
+// ═════════════════════════════════════════════════════════════════════════════
 
 /**
  * POST /api/notifications/send
  * Crea y envía una notificación a un usuario específico.
- * Protegido por API Key (uso exclusivo del backend).
  * Requiere: tenant, recipientId, title, message
  */
 const sendNotification = async (req, res, next) => {
     try {
-        const { tenant, recipientId, senderId, type, module, title, message, metadata } = req.body;
+        const tenant = asId(req.body?.tenant);
+        const recipientId = asId(req.body?.recipientId);
+        if (!tenant || !recipientId) return badRequest(res, 'tenant y recipientId requeridos (formato invalido)');
 
-        if (!tenant || !recipientId || !title || !message) {
-            return res.status(400).json({
-                success: false,
-                message: 'Campos requeridos: tenant, recipientId, title, message',
-            });
-        }
+        const { value, error } = parseNotificationBody(req.body, { defaultType: 'manual' });
+        if (error) return badRequest(res, error);
 
-        const notification = await Notification.create({
-            tenant,
-            recipientId,
-            senderId: senderId || null,
-            type: type || 'manual',
-            module: module || 'general',
-            title,
-            message,
-            metadata: metadata || {},
-        });
+        const notification = await Notification.create({ tenant, recipientId, ...value });
 
-        // Enviar en tiempo real vía WebSocket (scoped por tenant)
         emitToUser(tenant, recipientId, notification);
 
-        // Actualizar contador de no leídas (scoped por tenant)
-        const unreadCount = await Notification.countDocuments({
-            tenant,
-            recipientId,
-            read: false,
-        });
+        const unreadCount = await Notification.countDocuments({ tenant, recipientId, read: false });
         emitUnreadCount(tenant, recipientId, unreadCount);
 
-        res.status(201).json({
-            success: true,
-            message: 'Notificacion enviada',
-            data: notification,
-        });
+        res.status(201).json({ success: true, message: 'Notificacion enviada', data: notification });
     } catch (error) {
         next(error);
     }
@@ -53,34 +39,30 @@ const sendNotification = async (req, res, next) => {
 /**
  * POST /api/notifications/send-bulk
  * Envía la misma notificación a múltiples usuarios de un mismo tenant.
- * Protegido por API Key.
  * Requiere: tenant, recipientIds, title, message
  */
 const sendBulkNotification = async (req, res, next) => {
     try {
-        const { tenant, recipientIds, senderId, type, module, title, message, metadata } = req.body;
-
-        if (!tenant || !Array.isArray(recipientIds) || recipientIds.length === 0 || !title || !message) {
-            return res.status(400).json({
-                success: false,
-                message: 'Campos requeridos: tenant, recipientIds (array), title, message',
-            });
+        const tenant = asId(req.body?.tenant);
+        const rawIds = req.body?.recipientIds;
+        if (!tenant || !Array.isArray(rawIds) || rawIds.length === 0) {
+            return badRequest(res, 'tenant y recipientIds (array) requeridos');
+        }
+        if (rawIds.length > MAX_BULK_RECIPIENTS) {
+            return badRequest(res, `recipientIds admite maximo ${MAX_BULK_RECIPIENTS} destinatarios`);
         }
 
-        const docs = recipientIds.map((recipientId) => ({
-            tenant,
-            recipientId,
-            senderId: senderId || null,
-            type: type || 'system',
-            module: module || 'general',
-            title,
-            message,
-            metadata: metadata || {},
-        }));
+        const recipientIds = rawIds.map(asId);
+        if (recipientIds.some((id) => !id)) return badRequest(res, 'recipientIds contiene valores invalidos');
 
-        const notifications = await Notification.insertMany(docs);
+        const { value, error } = parseNotificationBody(req.body, { defaultType: 'system' });
+        if (error) return badRequest(res, error);
 
-        // Emitir a cada usuario dentro del tenant
+        const uniqueIds = [...new Set(recipientIds)];
+        const notifications = await Notification.insertMany(
+            uniqueIds.map((recipientId) => ({ tenant, recipientId, ...value }))
+        );
+
         for (const notif of notifications) {
             emitToUser(tenant, notif.recipientId, notif);
         }
@@ -97,52 +79,60 @@ const sendBulkNotification = async (req, res, next) => {
 
 /**
  * POST /api/notifications/broadcast
- * Envía una notificación a todos los conectados de un tenant (o a todos si no se especifica).
- * Protegido por API Key.
+ * Emite a los conectados de: un tenant (`tenant`), varios tenants (`tenants`, array)
+ * o todos (sin ninguno de los dos). `tenant` y `tenants` son excluyentes.
+ * No se persiste. La autorización de quién puede hacerlo vive en el backend PHP.
  */
 const broadcastNotification = async (req, res, next) => {
     try {
-        const { tenant, senderId, type, module, title, message, metadata } = req.body;
+        const hasTenant = req.body?.tenant !== undefined && req.body?.tenant !== null;
+        const hasTenants = req.body?.tenants !== undefined && req.body?.tenants !== null;
+        if (hasTenant && hasTenants) return badRequest(res, 'Use tenant o tenants, no ambos');
 
-        if (!title || !message) {
-            return res.status(400).json({
-                success: false,
-                message: 'Campos requeridos: title, message',
-            });
+        let target = null; // null = todos
+        if (hasTenant) {
+            target = asId(req.body.tenant);
+            if (!target) return badRequest(res, 'tenant invalido');
+        } else if (hasTenants) {
+            target = asIdList(req.body.tenants, MAX_BROADCAST_TENANTS);
+            if (!target) return badRequest(res, `tenants invalido (array de 1 a ${MAX_BROADCAST_TENANTS} ids)`);
         }
 
+        const { value, error } = parseNotificationBody(req.body, { defaultType: 'system' });
+        if (error) return badRequest(res, error);
+
+        // Si va a un solo tenant se informa en la notificación; con varios o todos queda null
         const notification = {
-            tenant: tenant || null,
-            senderId: senderId || null,
-            type: type || 'system',
-            module: module || 'general',
-            title,
-            message,
-            metadata: metadata || {},
+            tenant: typeof target === 'string' ? target : null,
+            ...value,
             createdAt: new Date(),
         };
 
-        emitBroadcast(notification, tenant);
+        emitBroadcast(notification, target);
 
-        res.status(200).json({
-            success: true,
-            message: tenant ? `Broadcast enviado al tenant ${tenant}` : 'Broadcast enviado a todos',
-            data: notification,
-        });
+        let message = 'Broadcast enviado a todos';
+        if (typeof target === 'string') message = `Broadcast enviado al tenant ${target}`;
+        else if (Array.isArray(target)) message = `Broadcast enviado a ${target.length} tenants`;
+
+        res.status(200).json({ success: true, message, data: notification });
     } catch (error) {
         next(error);
     }
 };
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Rutas del usuario autenticado (JWT de notificaciones). tenant/userId salen
+// SIEMPRE de req.auth; nunca de la URL ni del body.
+// ═════════════════════════════════════════════════════════════════════════════
+
 /**
- * GET /api/notifications/:tenant/:userId
- * Obtiene las notificaciones de un usuario dentro de su tenant con paginación.
+ * GET /api/notifications?page=1&limit=20&unread=true
  */
 const getUserNotifications = async (req, res, next) => {
     try {
-        const { tenant, userId } = req.params;
-        const page = Math.max(1, parseInt(req.query.page) || 1);
-        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+        const { tenant, userId } = req.auth;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
         const onlyUnread = req.query.unread === 'true';
 
         const filter = { tenant, recipientId: userId };
@@ -160,12 +150,7 @@ const getUserNotifications = async (req, res, next) => {
         res.json({
             success: true,
             data: notifications,
-            pagination: {
-                page,
-                limit,
-                total,
-                pages: Math.ceil(total / limit),
-            },
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) },
         });
     } catch (error) {
         next(error);
@@ -173,18 +158,12 @@ const getUserNotifications = async (req, res, next) => {
 };
 
 /**
- * GET /api/notifications/:tenant/:userId/unread-count
- * Devuelve la cantidad de notificaciones no leídas para un usuario en su tenant.
+ * GET /api/notifications/unread-count
  */
 const getUnreadCount = async (req, res, next) => {
     try {
-        const { tenant, userId } = req.params;
-        const count = await Notification.countDocuments({
-            tenant,
-            recipientId: userId,
-            read: false,
-        });
-
+        const { tenant, userId } = req.auth;
+        const count = await Notification.countDocuments({ tenant, recipientId: userId, read: false });
         res.json({ success: true, data: { count } });
     } catch (error) {
         next(error);
@@ -193,30 +172,27 @@ const getUnreadCount = async (req, res, next) => {
 
 /**
  * PATCH /api/notifications/:id/read
- * Marca una notificación como leída.
+ * Solo puede marcar notificaciones propias (mismo tenant y mismo destinatario).
  */
 const markAsRead = async (req, res, next) => {
     try {
-        const notification = await Notification.findByIdAndUpdate(
-            req.params.id,
+        const { tenant, userId } = req.auth;
+        const { id } = req.params;
+
+        if (!mongoose.isValidObjectId(id)) return badRequest(res, 'Id de notificacion invalido');
+
+        const notification = await Notification.findOneAndUpdate(
+            { _id: id, tenant, recipientId: userId },
             { read: true, readAt: new Date() },
             { new: true }
         );
 
         if (!notification) {
-            return res.status(404).json({
-                success: false,
-                message: 'Notificacion no encontrada',
-            });
+            return res.status(404).json({ success: false, message: 'Notificacion no encontrada' });
         }
 
-        // Actualizar contador en tiempo real (scoped por tenant)
-        const unreadCount = await Notification.countDocuments({
-            tenant: notification.tenant,
-            recipientId: notification.recipientId,
-            read: false,
-        });
-        emitUnreadCount(notification.tenant, notification.recipientId, unreadCount);
+        const unreadCount = await Notification.countDocuments({ tenant, recipientId: userId, read: false });
+        emitUnreadCount(tenant, userId, unreadCount);
 
         res.json({ success: true, data: notification });
     } catch (error) {
@@ -225,12 +201,11 @@ const markAsRead = async (req, res, next) => {
 };
 
 /**
- * PATCH /api/notifications/:tenant/:userId/read-all
- * Marca todas las notificaciones de un usuario en su tenant como leídas.
+ * PATCH /api/notifications/read-all
  */
 const markAllAsRead = async (req, res, next) => {
     try {
-        const { tenant, userId } = req.params;
+        const { tenant, userId } = req.auth;
 
         await Notification.updateMany(
             { tenant, recipientId: userId, read: false },

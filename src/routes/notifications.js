@@ -1,19 +1,22 @@
 const { Router } = require('express');
 const apiKeyAuth = require('../middleware/apiKeyAuth');
+const jwtAuth = require('../middleware/jwtAuth');
 const ctrl = require('../controllers/notificationController');
 
 const router = Router();
 
-// ─── Rutas protegidas por API Key (solo backend) ────────────────────────────
+// ─── Rutas protegidas por API Key (solo backend, red Docker interna) ────────
+// No deben exponerse en el proxy público (ver nginx/nginx.conf).
 router.post('/send', apiKeyAuth, ctrl.sendNotification);
 router.post('/send-bulk', apiKeyAuth, ctrl.sendBulkNotification);
 router.post('/broadcast', apiKeyAuth, ctrl.broadcastNotification);
 
-// ─── Rutas públicas (frontend consume directamente) ─────────────────────────
-// Todas las rutas de lectura requieren tenant + userId para aislar datos entre clientes
-router.get('/:tenant/:userId', ctrl.getUserNotifications);
-router.get('/:tenant/:userId/unread-count', ctrl.getUnreadCount);
-router.patch('/:id/read', ctrl.markAsRead);
-router.patch('/:tenant/:userId/read-all', ctrl.markAllAsRead);
+// ─── Rutas del usuario (JWT de notificaciones emitido por el backend) ───────
+// La identidad (tenant + userId) se toma del token, no de la URL.
+// Las rutas estáticas van antes que '/:id/read'.
+router.get('/', jwtAuth, ctrl.getUserNotifications);
+router.get('/unread-count', jwtAuth, ctrl.getUnreadCount);
+router.patch('/read-all', jwtAuth, ctrl.markAllAsRead);
+router.patch('/:id/read', jwtAuth, ctrl.markAsRead);
 
 module.exports = router;
